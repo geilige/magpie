@@ -15,15 +15,22 @@
 | `internal/agent/workbuddy_instances_test.go` | 新增 | 上面那个文件的测试：枚举、按数字排序、写出的必须是裸数组、与默认行去重、在 `onMachine` 里注册上了 | R7 |
 | `internal/agent/agents.go` | 修改（+1 行） | `onMachineAll` 收尾的 append 链尾追加 `workbuddyInstances(home)...` | R7 |
 | `internal/agentenv/agentenv.go` | 修改（+1 行） | `Vars` 加 `WORKBUDDY_INSTANCES_ROOT`。`TestFolderVarsAreListed` 要求 package agent 读的每个目录变量都在 `Vars` 里，否则每个 sandbox 都不会清它，测试会读到开发机真实的实例目录 | R7 |
+| `internal/update/signed.go` | 修改（2 行） | `signingKey` 换成我们自己的 ed25519 公钥，并把注释说清「不是上游那把」。官方包因此验签失败，覆盖不了定制版 | M3a |
+| `internal/update/fallback.go` | 修改（1 行） | `siteFeed` 从 `Site + "/api/latest"` 换成 `https://geilige.github.io/magpie/latest.json`。`Site` 常量不动（attest 与文档链接还在用） | M3a |
+| `internal/update/testdata/signed-sample.sig` | 修改（重签） | `TestEmbeddedKeyVerifiesCIsSignature` 用**内嵌公钥**验这份样本，换 key 后必须用我们的私钥对同一份 `.msg` 重签，否则该测试红。`.msg` 一字未改 | M3a |
+| `scripts/sign-release.ps1` | 新增 | 发布时给 `SHA256SUMS` 签名（ed25519 / `-rawin`），并带 `-Verify` 自验；格式与 `verify()` 逐字节一致 | M3a |
+| `scripts/setup-custom.ps1` | 新增 | 一次性引导：加 `upstream` remote、建 `custom`、开 `rerere`/`zdiff3`/`pull.rebase=false` | M1 |
+| `scripts/sync-upstream.ps1` | 新增 | 日常同步：fetch → merge → 冲突预警 → 冒烟编译，退出码 0/10/11/12/13 | M1 |
 
 ### 说明
 
-- M2 已落地。三个源码文件的改动与计划一致；多出来的 `agentenv.go` 一行不是新功能，是上游守护测试的硬要求
-  （`internal/agent/agentenv_test.go:65`），不加则 `go test ./internal/agent` 红。
-- `workbuddy_instances.go` 靠替换 `Sync` 和 `Fields[0].Set` 两个闭包来复用 `workbuddyBuild`，**没有改 `workbuddy.go`**。
-  上游若重构 `workbuddyBuild` 的内部实现，坏在运行期而不是编译期：详见该文件顶部注释。
-- `internal/update/signed.go`、`internal/update/update.go` 属于 M3 的更新源改造，等实际改完再登记，
-  不要提前写进来（会让预警一直报「上游也在动」的假信号）。
+- **M2**：`workbuddy_instances.go` 靠替换 `Sync` 和 `Fields[0].Set` 两个闭包复用 `workbuddyBuild`，**没有改 `workbuddy.go`**。
+  `agentenv.go` 那一行不是新功能，是上游守护测试的硬要求（`internal/agent/agentenv_test.go:65`）。
+- **M3a**：`signed.go` 是我们唯一在 `internal/update/` 里动逻辑的地方；`attest.go` 一个字没动，构建溯源留到 M3b。
+  `testdata/signed-sample.sig` 属于「换 key 必须跟着换的测试数据」，不是测试代码：`.msg` 保持原样，重签后
+  `TestEmbeddedKeyVerifiesCIsSignature` 仍然在验证「内嵌公钥 = 我们 CI 签名用的那把」。
+- M3b 计划：`.github/workflows/release-custom.yml` + `attestRepo` 换成我们自己的仓库，届时再登记。
+- `internal/update/` 里除 `signed.go`、`fallback.go`、`testdata/signed-sample.sig` 之外没有任何改动。
 
 ## 机器可读区
 
@@ -39,4 +46,10 @@ internal/agent/workbuddy_instances.go
 internal/agent/workbuddy_instances_test.go
 internal/agent/agents.go
 internal/agentenv/agentenv.go
+internal/update/signed.go
+internal/update/fallback.go
+internal/update/testdata/signed-sample.sig
+scripts/setup-custom.ps1
+scripts/sync-upstream.ps1
+scripts/sign-release.ps1
 <!-- patches:end -->

@@ -37,8 +37,9 @@ const releaseRepo = "yetone/magpie-releases"
 // the check for the client's ten minutes. A var for tests.
 var feedWait = 20 * time.Second
 
-// siteFeed is the default feed; a var for tests.
-var siteFeed = Site + "/api/latest"
+// siteFeed is the default feed: ours, not the site's (Site stays the site
+// for attestation and the docs' links). A var for tests.
+var siteFeed = "https://geilige.github.io/magpie/latest.json"
 
 // maxSmall bounds SHA256SUMS and its signature.
 const maxSmall = 1 << 20

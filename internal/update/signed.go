@@ -26,9 +26,12 @@ import (
 // (and the first update into the signed era, taken by a binary that has no
 // key yet) are checked by SHA-256 from the feed as before.
 
-// signingKey is the public half (base64, raw 32 bytes) of the release
-// signing key. A var for tests.
-var signingKey = "3XuYQEohIRDF+zxGQry1iXGZ1cfKYFX3vsST6GSSbYQ="
+// signingKey is the public half (base64, raw 32 bytes) of our release
+// signing key, not the one yetone/magpie-releases signs with: a release
+// signed there (or by anyone else) does not verify here, so an official
+// build cannot replace this one (signed_test's TestSignedByOtherKeyRefused).
+// A var for tests.
+var signingKey = "lF7L86d/FS20ohijHND7SikMnZrVdrEa6eD9IKP7Ec8="
 
 // firstSigned is the first release published with a SHA256SUMS.sig.
 const firstSigned = "0.1.3862"
