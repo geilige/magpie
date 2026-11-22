@@ -43,26 +43,63 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $ErrorActionPreference = 'Stop'
+
+          # tag 不在这个 fork 里：fork 自己一个 tag 引用都没有（gh api repos/…/tags 是 0），
+          # checkout 怎么配都拿不到。从上游取，并且只取 tag、不取分支；
+          # 对象大多已经在本地（历史是同步下来的），这一跳很便宜。
+          git fetch --quiet --no-tags https://github.com/yetone/magpie.git 'refs/tags/*:refs/tags/*'
+          if ($LASTEXITCODE -ne 0) {
+            throw "cannot fetch upstream's tags (exit $LASTEXITCODE): the tag check cannot run without them"
+          }
+
+          # git 失败了输出是空的，先接住输出和退出码、最后才 Trim。
+          # 顺序反了会炸成 null 引用，把 "No names found" 这类真正的报错盖掉。
+          function Invoke-Git {
+            param([string[]]$GitArgs)
+            $lines = @(& git @GitArgs 2>&1)
+            $code = $LASTEXITCODE
+            $text = (@($lines | Where-Object { $null -ne $_ } | ForEach-Object { $_.ToString() }) -join ' ').Trim()
+            return [pscustomobject]@{ Code = $code; Text = $text }
+          }
+
           $tag = $env:TAG
           if ($tag -notmatch '^v(\d+\.\d+\.\d+)-custom\.(\d+)$') {
             throw "tag '$tag' is not v<upstream version>-custom.<n>"
           }
           $base = $Matches[1]
-          $here = @(git tag --points-at HEAD)
+
+          $headCall = Invoke-Git @('rev-parse', '--short', 'HEAD')
+          if ($headCall.Code -ne 0 -or $headCall.Text -eq '') {
+            throw "cannot read HEAD (git rev-parse exit $($headCall.Code), said: '$($headCall.Text)')"
+          }
+          $head = $headCall.Text
+
+          # 分两种：一个 tag 都没有（fetch 没生效），还是有 tag 但不在这个提交上
+          $tagsHere = Invoke-Git @('tag', '--points-at', 'HEAD')
+          if ($tagsHere.Code -ne 0) {
+            throw "git tag --points-at HEAD failed (exit $($tagsHere.Code), said: '$($tagsHere.Text)')"
+          }
+          $here = @($tagsHere.Text -split '\s+' | Where-Object { $_ -ne '' })
+          if ($here.Count -eq 0) {
+            $known = @(git tag 2>$null).Count
+            throw "no tag points at $head, so '$tag' must be on another commit ($known tags are known here): the release would build different commits than the tag names"
+          }
           if ($here -notcontains $tag) {
-            throw "tag '$tag' is not on the tip ($(git rev-parse --short HEAD)); the release would carry other commits. Tags here: $($here -join ', ')"
+            throw "tag '$tag' is not on $head (this commit has: $($here -join ', ')): the release would build different commits than the tag names"
           }
-          $nearest = (git describe --tags --abbrev=0 --exclude '*-custom.*').Trim()
-          if ($LASTEXITCODE -ne 0 -or $nearest -eq '') {
-            throw 'no upstream tag in history: cannot tell which upstream version this is based on'
+
+          $describe = Invoke-Git @('describe', '--tags', '--abbrev=0', '--exclude', '*-custom.*')
+          if ($describe.Code -ne 0 -or $describe.Text -eq '') {
+            throw "no upstream tag in this checkout (git describe exit $($describe.Code), said: '$($describe.Text)'). The tags should have been fetched from yetone/magpie just above; check that fetch."
           }
+          $nearest = $describe.Text
           if ($nearest -ne "v$base") {
             throw "tag '$tag' says upstream v$base, but the newest upstream tag in this history is '$nearest'"
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "VERSION=$($tag.Substring(1))" -Encoding ascii
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "BASE=$base" -Encoding ascii
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "TAG=$tag" -Encoding ascii
-          Write-Host "tag $tag on $(git rev-parse --short HEAD), upstream base v$base"
+          Write-Host "tag $tag on $head, upstream base v$base"
 
       # windows-latest 镜像里没有 GNU make（只有 CMake），装一个即可；幂等：
       # 已经有了就只打印版本，不重装。
