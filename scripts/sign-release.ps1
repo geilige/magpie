@@ -79,6 +79,17 @@ function Stop-With {
     exit $Code
 }
 
+# 相对路径按 PowerShell 的当前位置解析，不能用 [System.IO.Path]::GetFullPath：
+# 后者按 .NET 的 CurrentDirectory 解析，而 Set-Location 不会改它。两者可以不同
+# （PowerShell 里切了目录、或宿主进程从别处启动），GetFullPath(".") 就会指到别处。
+# GetUnresolvedProviderPathFromPSPath 允许目标还不存在，正好用来解析还没创建的输出文件。
+function Resolve-FullPath {
+    [CmdletBinding()]
+    param([string]$Path)
+    if ($Path -eq '') { return '' }
+    return $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
 # 调 openssl，收集输出供失败时原文打印；不打印任何私钥内容（openssl 本身也不会把私钥打到 stdout）
 function Invoke-OpenSsl {
     param([string[]]$OpenSslArgs)
@@ -182,7 +193,7 @@ if (Test-Path -LiteralPath $SumsPath -PathType Container) {
 } else {
     $sumsFile = $SumsPath
 }
-$sumsFile = [System.IO.Path]::GetFullPath($sumsFile)
+$sumsFile = Resolve-FullPath $sumsFile
 $sumsDir = [System.IO.Path]::GetDirectoryName($sumsFile)
 $sigFile = Join-Path $sumsDir 'SHA256SUMS.sig'
 
@@ -212,6 +223,7 @@ try {
 
     $keyFile = Resolve-KeyPath
     if ($keyFile -ne '') {
+        $keyFile = Resolve-FullPath $keyFile
         if (-not (Test-Path -LiteralPath $keyFile -PathType Leaf)) {
             Stop-With 1 ("signing key not found: {0} (pass -KeyPath, or set MAGPIE_UPDATE_SIGNING_KEY)" -f $keyFile)
         }

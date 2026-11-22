@@ -89,7 +89,9 @@ import (
 const firstAttested = "0.1.3891"
 
 // attestRepo is where the attestations are stored and what they must name.
-const attestRepo = "yetone/magpie-releases"
+// Ours, not upstream's: a bundle of yetone/magpie-releases' workflow names
+// that repository's workflow as its source and is refused here.
+const attestRepo = "geilige/magpie"
 
 //go:embed attest_root.json
 var attestRootJSON []byte

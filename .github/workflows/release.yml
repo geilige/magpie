@@ -1,206 +1,214 @@
-name: Release
+name: Release (custom)
 
-# Pushing a v* tag hands off to yetone/magpie-releases, which builds, signs,
-# notarises and publishes magpie there; that repo is where people download
-# from, and the signing secrets live only there. Once its release has every
-# asset, the same release is copied here, so this repo's Releases page has
-# the installers too (PapainTea on X). Self-update, install.sh and the site
-# still read magpie-releases only.
-
+# 只在定制 tag 上跑：v<上游版本>-custom.<序号>，例如 v0.1.4657-custom.1。
+# 文件名必须是 release.yml：internal/update/attest.go 的 SAN 正则写死了
+# /.github/workflows/release.yml@refs/(heads/main|tags/v…)，改名字溯源就匹配不上。
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to release (e.g., 0.1.0 — no v prefix; the v tag must exist)'
-        required: true
-        type: string
+    tags: ['v*-custom.*']
+
+permissions:
+  contents: write      # 建 Release、推 gh-pages
+  id-token: write      # attest-build-provenance 要的 OIDC 令牌
+  attestations: write  # 写构建溯源
+
+# 两个发布不能同时改 gh-pages
+concurrency:
+  group: release-custom
+  cancel-in-progress: false
 
 jobs:
-  trigger-release:
-    runs-on: ubuntu-latest
-    # room for the dispatch to wait out the owner's API rate limit (65 min)
-    timeout-minutes: 75
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      ref: ${{ steps.version.outputs.ref }}
-
+  release:
+    name: build, sign, publish
+    runs-on: windows-latest
+    timeout-minutes: 60
     steps:
-      - name: Get version
-        id: version
+      - name: Check out custom
+        uses: actions/checkout@v4
+        with:
+          ref: custom
+          fetch-depth: 0   # tag 校验与 git describe 都要全量历史
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # 版本跟 go.mod 走，不写死
+          cache: true
+
+      # tag 必须打在 custom 的 tip 上，且基础版本必须是历史里那个上游 tag。
+      # 打在旧提交上、或从错的上游基线拉出来的 tag，在这里停下，不产出错包。
+      - name: Check the tag matches the source
+        shell: pwsh
         env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
+          TAG: ${{ github.ref_name }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            REF="$GITHUB_REF_NAME"
-            VERSION="${REF#v}"
-          else
-            VERSION="$INPUT_VERSION"
-            REF="v$INPUT_VERSION"
-          fi
-          # a newline or quote would add outputs or break the JSON below
-          [[ "$VERSION" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || { echo "bad version: $VERSION" >&2; exit 1; }
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "ref=$REF" >> $GITHUB_OUTPUT
-          echo "Triggering release for version: $VERSION (ref: $REF)"
-
-      - name: Trigger release workflow in magpie-releases
-        env:
-          # PAT with contents write on yetone/magpie-releases. It is the
-          # owner's, so it shares the 5,000/hr core limit with every `gh`
-          # the owner runs: v0.1.3561 to v0.1.3573 failed here with "API
-          # rate limit exceeded" and never got a release. A rate-limited
-          # answer waits for the reset and tries again, up to 65 minutes.
-          TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
-          API_URL: ${{ github.api_url }}
-          REF: ${{ steps.version.outputs.ref }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          payload=$(jq -nc --arg ref "$REF" --arg version "$VERSION" \
-            '{event_type: "release", client_payload: {ref: $ref, version: $version}}')
-          url="$API_URL/repos/yetone/magpie-releases/dispatches"
-          tmp=$(mktemp -d)
-          deadline=$(( $(date +%s) + ${DISPATCH_MAX_WAIT:-3900} ))
-          header() { awk -v k="$1" -F': *' 'tolower($1) == k { v = $2 } END { sub(/\r$/, "", v); print v }' "$tmp/headers"; }
-          for try in $(seq 1 100); do
-            code=$(curl -sS -o "$tmp/body" -D "$tmp/headers" -w '%{http_code}' -X POST \
-              -H "Authorization: Bearer $TOKEN" \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              --data "$payload" "$url") || { echo "::error::dispatch request failed (curl exit $?)"; exit 1; }
-            if [[ "$code" == 2* ]]; then
-              echo "Dispatched release for $REF (HTTP $code, try $try)"
-              exit 0
-            fi
-            retry_after=$(header retry-after)
-            remaining=$(header x-ratelimit-remaining)
-            reset=$(header x-ratelimit-reset)
-            limited=
-            if [[ "$code" == 403 || "$code" == 429 ]]; then
-              if [[ -n "$retry_after" || "$remaining" == 0 ]] || grep -qi 'rate limit' "$tmp/body"; then
-                limited=1
-              fi
-            fi
-            if [[ -z "$limited" ]]; then
-              echo "::error::dispatch failed with HTTP $code"
-              cat "$tmp/body"; echo
-              exit 1
-            fi
-            now=$(date +%s)
-            if [[ "$retry_after" =~ ^[0-9]+$ ]]; then
-              until=$(( now + retry_after ))
-            elif [[ "$reset" =~ ^[0-9]+$ ]] && (( reset > now )); then
-              until=$reset
-            else
-              until=$(( now + 60 )) # a secondary limit may give neither
-            fi
-            until=$(( until + 5 ))
-            if (( until > deadline )); then
-              echo "::error::rate limited (HTTP $code) until $(date -u -d "@$until" 2>/dev/null || echo "$until"), past the wait allowed"
-              cat "$tmp/body"; echo
-              exit 1
-            fi
-            echo "::warning::rate limited (HTTP $code, try $try); waiting $(( until - now ))s for the limit to reset"
-            sleep $(( until - now ))
-          done
-          echo "::error::dispatch still rate limited after $try tries"
-          exit 1
-
-      - name: Output status
-        run: echo "Watch the build at https://github.com/yetone/magpie-releases/actions"
-
-  mirror-release:
-    needs: trigger-release
-    runs-on: ubuntu-latest
-    # magpie-releases' macOS jobs can wait an hour or more for a hosted
-    # runner when several tags queue: v0.1.2262 published 62 minutes after
-    # its tag, two minutes after a 60-minute wait here gave up, and it was
-    # never copied here (#4488)
-    timeout-minutes: 330
-    permissions:
-      contents: write
-      issues: write # to say a release went out without Chinese notes
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      REF: ${{ needs.trigger-release.outputs.ref }}
-      ASSETS: 17 # what every release carries; a smaller count is still uploading
-    steps:
-      - name: Wait for magpie-releases to publish every asset
-        run: |
-          for i in $(seq 1 600); do
-            n=$(gh release view "$REF" -R yetone/magpie-releases --json assets -q '.assets | length' 2>/dev/null || echo 0)
-            echo "attempt $i: $n of $ASSETS assets"
-            [ "$n" -ge "$ASSETS" ] && exit 0
-            sleep 30
-          done
-          echo "magpie-releases never published $REF with $ASSETS assets" >&2
-          exit 1
-
-      - name: Copy the release here
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          gh release download "$REF" -R yetone/magpie-releases -D dist
-          gh release view "$REF" -R yetone/magpie-releases --json body -q .body > notes.md
-          printf '\n\n---\nThe same release, and the feed magpie updates from: https://github.com/yetone/magpie-releases/releases/tag/%s\n' "$REF" >> notes.md
-          # GitHub marks the release published last Latest unless told
-          # otherwise. v0.1.3360's mac signing failed and its rerun was
-          # copied here after 3361 and 3362, so it took the mark (11-09):
-          # a release is Latest only when no published one here is higher,
-          # and the highest has the mark once this one is out.
-          newest() {
-            gh release list -R "$GITHUB_REPOSITORY" -L 100 --exclude-drafts --exclude-pre-releases --json tagName -q '.[].tagName' |
-              { grep -E '^v[0-9]+(\.[0-9]+)*$' || true; } | sort -V | tail -1
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:TAG
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)-custom\.(\d+)$') {
+            throw "tag '$tag' is not v<upstream version>-custom.<n>"
           }
-          top=$(newest)
-          if [ -z "$top" ] || [ "$(printf '%s\n%s\n' "$top" "$REF" | sort -V | tail -1)" = "$REF" ]; then
-            latest=true
-          else
-            latest=false
-            echo "$top is newer: $REF is copied without the Latest mark"
+          $base = $Matches[1]
+          $here = @(git tag --points-at HEAD)
+          if ($here -notcontains $tag) {
+            throw "tag '$tag' is not on the tip ($(git rev-parse --short HEAD)); the release would carry other commits. Tags here: $($here -join ', ')"
+          }
+          $nearest = (git describe --tags --abbrev=0 --exclude '*-custom.*').Trim()
+          if ($LASTEXITCODE -ne 0 -or $nearest -eq '') {
+            throw 'no upstream tag in history: cannot tell which upstream version this is based on'
+          }
+          if ($nearest -ne "v$base") {
+            throw "tag '$tag' says upstream v$base, but the newest upstream tag in this history is '$nearest'"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "VERSION=$($tag.Substring(1))" -Encoding ascii
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "BASE=$base" -Encoding ascii
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TAG=$tag" -Encoding ascii
+          Write-Host "tag $tag on $(git rev-parse --short HEAD), upstream base v$base"
+
+      # windows-latest 镜像里没有 GNU make（只有 CMake），装一个即可；幂等：
+      # 已经有了就只打印版本，不重装。
+      - name: Ensure make
+        shell: bash
+        run: |
+          if ! command -v make >/dev/null 2>&1; then
+            choco install make -y --no-progress
+            export PATH="/c/ProgramData/chocolatey/bin:$PATH"
           fi
-          if gh release view "$REF" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$REF" -R "$GITHUB_REPOSITORY" --notes-file notes.md --latest="$latest"
-            gh release upload "$REF" dist/* -R "$GITHUB_REPOSITORY" --clobber
+          make --version
+
+      - name: Build the Windows app
+        shell: bash
+        run: make release-windows VERSION="$TAG"
+
+      # 只要 windows 两个架构：默认 TARGETS 还含 darwin/linux/android 七个目标，
+      # 这一版不发布它们（DESIGN.md D7），多编只会让流水线更慢更脆。
+      - name: Build the CLI
+        shell: bash
+        run: make release-cli VERSION="$TAG" TARGETS="windows/amd64 windows/arm64"
+
+      # 逐字节可控的清单：显式四个文件名、LF 行尾、<hex> + 两个空格 + 名字。
+      # 不能用 sha256sum dist/*：那样会把 SHA256SUMS 自己（空文件的哈希）也写进去。
+      - name: Write SHA256SUMS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $names = @(
+            'magpie-windows-amd64.exe',
+            'magpie-windows-arm64.exe',
+            'magpie-cli-windows-amd64.exe',
+            'magpie-cli-windows-arm64.exe'
+          )
+          $lines = foreach ($n in $names) {
+            $p = Join-Path 'dist' $n
+            if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "missing $p" }
+            $h = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $n"
+          }
+          $text = ($lines -join "`n") + "`n"
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'SHA256SUMS'), $text, (New-Object System.Text.ASCIIEncoding))
+          Get-Content -LiteralPath 'SHA256SUMS' | ForEach-Object { Write-Host $_ }
+
+      - name: Write the release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $text = "基于上游 v$env:BASE 的定制版"
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'release-notes.md'), $text, (New-Object System.Text.UTF8Encoding($false)))
+
+      # 私钥只在 RUNNER_TEMP 里存在，签完立刻删；自验失败则该步非零退出，发布中止。
+      - name: Sign SHA256SUMS
+        shell: pwsh
+        env:
+          SIGNING_KEY: ${{ secrets.MAGPIE_UPDATE_SIGNING_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY)) { throw 'MAGPIE_UPDATE_SIGNING_KEY is empty: add the secret first' }
+          $key = Join-Path $env:RUNNER_TEMP 'magpie-update-key.pem'
+          [System.IO.File]::WriteAllText($key, $env:SIGNING_KEY, (New-Object System.Text.UTF8Encoding($false)))
+          $code = 1
+          try {
+            ./scripts/sign-release.ps1 -Version $env:VERSION -SumsPath . -KeyPath $key
+            $code = $LASTEXITCODE
+          } finally {
+            if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Force }
+          }
+          if ($code -ne 0) { throw "sign-release.ps1 failed with exit code $code" }
+
+      # 上面那步被中断时兜底：任何情况下私钥文件都不留在 runner 上
+      - name: Remove the signing key
+        if: always()
+        shell: pwsh
+        run: |
+          $key = Join-Path $env:RUNNER_TEMP 'magpie-update-key.pem'
+          if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Force }
+          Write-Host "signing key gone: $(-not (Test-Path -LiteralPath $key))"
+
+      # 溯源：update 会拿签名清单里的 sha256 去问
+      # api.github.com/repos/geilige/magpie/attestations/sha256:<digest>，
+      # SAN 必须指向本仓库的 .github/workflows/release.yml
+      - name: Attest the release files
+        # v2 → v2.4.0 的 commit：这个 action 拿到 id-token 与 attestations 写权限，
+        # 浮动 tag 被改指向就等于谁都能替我们签溯源，所以钉死 SHA。
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/magpie-windows-amd64.exe
+            dist/magpie-windows-arm64.exe
+            dist/magpie-cli-windows-amd64.exe
+            dist/magpie-cli-windows-arm64.exe
+            SHA256SUMS
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # 重跑：资产覆盖、说明重写，不新建 release
+            gh release upload "$TAG" \
+              dist/magpie-windows-amd64.exe dist/magpie-windows-arm64.exe \
+              dist/magpie-cli-windows-amd64.exe dist/magpie-cli-windows-arm64.exe \
+              SHA256SUMS SHA256SUMS.sig --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
           else
-            gh release create "$REF" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --title "magpie $REF" --notes-file notes.md --latest="$latest"
-          fi
-          n=$(gh release view "$REF" -R "$GITHUB_REPOSITORY" --json assets -q '.assets | length')
-          echo "$REF has $n assets here"
-          [ "$n" -ge "$ASSETS" ]
-          # two copies at once can each decide before the other is out
-          top=$(newest)
-          now=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name 2>/dev/null || true)
-          if [ -n "$top" ] && [ "$now" != "$top" ]; then
-            echo "Latest here was ${now:-none}: giving the mark to $top"
-            gh release edit "$top" -R "$GITHUB_REPOSITORY" --latest >/dev/null
+            gh release create "$TAG" \
+              dist/magpie-windows-amd64.exe dist/magpie-windows-arm64.exe \
+              dist/magpie-cli-windows-amd64.exe dist/magpie-cli-windows-arm64.exe \
+              SHA256SUMS SHA256SUMS.sig \
+              --title "magpie $TAG" --notes-file release-notes.md
           fi
 
-      # The Chinese notes are written by magpie-releases' DeepSeek call, and
-      # when that call fails the release goes out in English alone: a spent
-      # balance did so for v0.1.1233 to v0.1.1242, and Chinese apps showed
-      # English for a day until a user said so (#2122). Its warning is in a
-      # log nobody reads, so a release without them is said here, on one
-      # open issue. magpie-releases' notes.yml writes them again each hour
-      # once DeepSeek answers (it didn't for v0.1.2634 to 2646, a spent
-      # balance again), and notes-mirror.yml copies them here.
-      - name: Say when the notes have no Chinese
-        env:
-          GH_REPO: ${{ github.repository }}
+      # latest.json 在清单与签名之后生成，assets 里只放四个二进制：
+      # 清单/签名/feed 自己都不能进 assets，否则 verify() 拿签名清单核对它们必失败。
+      - name: Write latest.json
+        shell: pwsh
         run: |
-          set -uo pipefail
-          if grep -qF '<!-- lang:zh -->' notes.md; then
-            echo "$REF has Chinese notes"
-            exit 0
+          $ErrorActionPreference = 'Stop'
+          $notes = [System.IO.File]::ReadAllText((Join-Path (Get-Location) 'release-notes.md')).Trim()
+          ./scripts/make-feed.ps1 -Version $env:VERSION -Repo "${{ github.repository }}" -SumsPath . -DistPath dist -OutPath latest.json -Notes $notes
+          if ($LASTEXITCODE -ne 0) { throw "make-feed.ps1 failed with exit code $LASTEXITCODE" }
+
+      # gh-pages 只是单文件的发布分支：已有就接在它后面，没有就从空树起一个。
+      # 用 plumbing 直接造 commit，不碰工作区，也不用 force push。
+      - name: Publish latest.json to gh-pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          parent=""
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --depth=1 origin gh-pages
+            parent=$(git rev-parse FETCH_HEAD)
           fi
-          title="Release notes without Chinese"
-          msg="$REF went out with English notes alone: magpie-releases' release run got no Chinese from DeepSeek. Its reason is the \`DeepSeek wrote no Chinese notes\` warning in that run's Generate changelog step (https://github.com/yetone/magpie-releases/actions); \`insufficient_balance_error\` means the DEEPSEEK_API_KEY account needs a top-up. Until then apps set to Chinese show its commit subjects (#2122). magpie-releases' notes.yml writes the notes again each hour once DeepSeek answers, and notes-mirror.yml copies them here; notes written by hand below a \`<!-- lang:zh -->\` marker are kept."
-          n=$(gh issue list --state open --search "\"$title\" in:title" --json number,title -q ".[] | select(.title == \"$title\") | .number" | head -1) || n=""
-          if [ -n "$n" ]; then
-            gh issue comment "$n" --body "$msg" || echo "::warning::could not comment on #$n: $msg"
+          blob=$(git hash-object -w latest.json)
+          tree=$(printf '100644 blob %s\tlatest.json\n' "$blob" | git mktree)
+          if [ -n "$parent" ]; then
+            commit=$(git commit-tree "$tree" -p "$parent" -m "feed: $TAG")
           else
-            gh issue create --title "$title" --body "$msg" || echo "::warning::could not file an issue: $msg"
+            commit=$(git commit-tree "$tree" -m "feed: $TAG")
           fi
+          git push origin "$commit:refs/heads/gh-pages"
+          echo "gh-pages now serves latest.json from $commit"
