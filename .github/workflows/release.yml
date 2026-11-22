@@ -24,13 +24,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out custom
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: custom
           fetch-depth: 0   # tag 校验与 git describe 都要全量历史
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod   # 版本跟 go.mod 走，不写死
           cache: true

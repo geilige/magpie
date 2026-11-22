@@ -18,6 +18,8 @@
       4  签完自验失败（此时不写 SHA256SUMS.sig，不会产出一个自己都验不过的签名）
       5  -Verify 验签失败（签名与 SHA256SUMS 或 Version 不匹配）
       6  -Verify 缺 SHA256SUMS.sig，或它不是一个 64 字节的 base64
+      7  私钥推导出的公钥与 internal/update/signed.go 的 signingKey 不一致：
+         secret 配错了，签出来的包所有客户端都会拒收
 
 .PARAMETER Version
     必填，不带 v 前缀，例如 0.1.4657-custom.1。
@@ -29,7 +31,8 @@
 
 .PARAMETER KeyPath
     ed25519 私钥文件（OpenSSL PEM）。默认读环境变量 MAGPIE_UPDATE_SIGNING_KEY。
-    -Verify 时可以不填：不填就用内嵌在 app 里的那把公钥验，验的就是 app 将来认的东西。
+    -Verify 时可以不填：不填就用 internal/update/signed.go 里的 signingKey 验，
+    验的就是 app 将来认的那把。
 
 .PARAMETER Verify
     只验签不签名：读 SHA256SUMS 与 SHA256SUMS.sig，用 openssl pkeyutl -verify 验。
@@ -38,6 +41,8 @@
     私钥内容任何时候都不打印、不写进仓库。临时文件建在 %TEMP%\magpie-sign-*，跑完删掉。
     SHA256SUMS 的每一个字节都参与签名，所以行尾（LF / CRLF）会被签进去：
     GitHub Actions 上 sha256sum 产出的是 LF，Windows 的 Out-File 是 CRLF，两者签名不通用。
+    signingKey 只在 internal/update/signed.go 里留一份：本脚本不复制它，-Verify 与签名的
+    配对校验都从源码里读，脚本里的副本和源码就不会漂移。
 #>
 
 [CmdletBinding()]
@@ -51,9 +56,8 @@ param(
 # 原生命令的 stderr 在 Stop 下会变成终止错误，这里固定 Continue，成败靠 $LASTEXITCODE。
 $ErrorActionPreference = 'Continue'
 
-# app 内嵌的公钥：internal/update/signed.go 的 signingKey（base64, raw 32 字节）。
-# 只在 -Verify 没给私钥时用 —— 验的就是二进制将来认的那把。
-$EmbeddedKeyBase64 = 'lF7L86d/FS20ohijHND7SikMnZrVdrEa6eD9IKP7Ec8='
+# app 内嵌的公钥不在这里复制一份：-Verify 要用它、签名的配对校验也要用它，
+# 两处都从 internal/update/signed.go 读，只留一个真相。
 
 # ed25519 的 SubjectPublicKeyInfo DER 前缀：SEQUENCE{OID 1.3.101.112, BIT STRING}
 $Ed25519SpkiPrefix = [byte[]](0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00)
@@ -132,10 +136,52 @@ function Export-PublicKey {
     }
 }
 
-# -Verify 没给私钥时，把内嵌的 raw 公钥包成 DER/PEM 给 openssl 用
+# signingKey 的唯一一份在 internal/update/signed.go 里。-Verify 要用它、签名的
+# 配对校验也要用它，所以只留这一个解析器，不各自写正则、也不在脚本里存副本。
+# 脚本永远在 <repo>/scripts/ 下，按脚本自己的位置找源码，不依赖当前目录。
+function Get-SigningKeyFromSource {
+    $src = Join-Path (Split-Path -Parent $PSScriptRoot) 'internal/update/signed.go'
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+        Stop-With 1 ("cannot find {0}: this script runs from the magpie repository" -f $src)
+    }
+    $text = [System.IO.File]::ReadAllText($src)
+    $m = [regex]::Match($text, '(?m)^var\s+signingKey\s*=\s*"([A-Za-z0-9+/=]+)"')
+    if (-not $m.Success) {
+        Stop-With 1 ("no 'var signingKey = ""...""' in {0}: the source changed shape, read it by hand" -f $src)
+    }
+    return $m.Groups[1].Value
+}
+
+# 私钥推导出的公钥，按 signed.go 的写法给出：base64 的 raw 32 字节
+function Get-DerivedPublicKeyBase64 {
+    param([string]$KeyFile)
+    $derPath = New-WorkFile 'derived-pub.der'
+    $r = Invoke-OpenSsl @('pkey', '-in', $KeyFile, '-pubout', '-outform', 'DER', '-out', $derPath)
+    if ($r.Exit -ne 0) {
+        Stop-With 3 ("openssl could not read the signing key at {0}: {1}" -f $KeyFile, $r.Output)
+    }
+    $der = [System.IO.File]::ReadAllBytes($derPath)
+    if ($der.Length -ne ($Ed25519SpkiPrefix.Length + 32)) {
+        Stop-With 3 ("the public key is {0} bytes of DER, not an ed25519 one" -f $der.Length)
+    }
+    for ($i = 0; $i -lt $Ed25519SpkiPrefix.Length; $i++) {
+        if ($der[$i] -ne $Ed25519SpkiPrefix[$i]) {
+            Stop-With 3 'the key is not an ed25519 one: its DER does not start with the ed25519 prefix'
+        }
+    }
+    $raw = New-Object byte[] 32
+    [System.Array]::Copy($der, $Ed25519SpkiPrefix.Length, $raw, 0, 32)
+    return [System.Convert]::ToBase64String($raw)
+}
+
+# -Verify 没给私钥时，把源码里那把 raw 公钥包成 DER/PEM 给 openssl 用
 function Export-EmbeddedPublicKey {
     param([string]$PemPath)
-    $raw = [System.Convert]::FromBase64String($EmbeddedKeyBase64)
+    $keyBase64 = Get-SigningKeyFromSource
+    $raw = [System.Convert]::FromBase64String($keyBase64)
+    if ($raw.Length -ne 32) {
+        Stop-With 1 ("signingKey in signed.go is {0} bytes of base64, not ed25519's 32" -f $raw.Length)
+    }
     $der = New-Object byte[] ($Ed25519SpkiPrefix.Length + $raw.Length)
     [System.Array]::Copy($Ed25519SpkiPrefix, 0, $der, 0, $Ed25519SpkiPrefix.Length)
     [System.Array]::Copy($raw, 0, $der, $Ed25519SpkiPrefix.Length, $raw.Length)
@@ -301,6 +347,16 @@ try {
         Stop-With 4 'the signature does not verify with its own public key; nothing was written'
     }
     Write-Item 'the signature verifies with the public half of the same key'
+
+    # 自验只证明「签名和它自己的公钥配得上」，secret 里放错一把钥匙照样通过。
+    # 再与源码里的 signingKey 对一遍：不一致时产出的包，每个由这份源码构建的
+    # magpie 都会拒收，而流水线却是绿的。
+    $derived = Get-DerivedPublicKeyBase64 -KeyFile $keyFile
+    $source = Get-SigningKeyFromSource
+    if ($derived -ne $source) {
+        Stop-With 7 ("the secret's private key does not match signingKey in internal/update/signed.go`n(derived {0}, source has {1}): a release signed with it would be refused by every magpie built from this source. Fix the secret, not the script." -f $derived, $source)
+    }
+    Write-Item 'the key pairs with signingKey in internal/update/signed.go'
 
     # 写盘：base64 单行 + 一个 LF（上游 testdata/signed-sample.sig 是 88 字符 + LF）
     $b64 = [System.Convert]::ToBase64String($sigBytes)

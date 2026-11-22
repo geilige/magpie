@@ -33,10 +33,59 @@
 - **M3a**：`signingKey` 换成我们的公钥后，官方包在 `verify()` 就失败，覆盖不了定制版；
   `testdata/signed-sample.sig` 属于「换 key 必须跟着换的测试数据」，不是测试代码。
 - **M3b**：`release.yml` 是上游文件，整文件替换——**冲突风险最高的一处**，上游每次改发布流程，
-  同步时都要人工看一遍。`attestRepo` 换成我们自己的仓库后，15 条溯源测试会红：它们的 fixture
-  （`testdata/attest/attestations-v0.1.3986.jsonl`）是上游真实 CI 签出的 Sigstore bundle，证书 SAN 写死
-  `yetone/magpie-releases`，本地无法重新生成。等第一次真实发布产出我们自己的 bundle 后，替换 fixture 即转绿。
+  同步时都要人工看一遍。`attestRepo` 换成我们自己的仓库后，15 条溯源测试永久红，见下一节。
 - 路线：M1 同步骨架 → M2 多开实例 → M3a 换 key/feed → M3b 发布流水线；M3b 之后才谈「打 tag 能装上」。
+
+## 已知红基线（`go test ./internal/update/`）
+
+> 下面 15 条在换 `attestRepo` 之后**永久红**，不是我们的改动坏了。
+> **清单内的忽略，清单外的一律当真问题查。**
+
+**为什么关不掉**
+
+`internal/update/attest_test.go:43-45` 的假服务器是这么断言请求的：
+
+```go
+if !strings.HasPrefix(r.URL.Path, "/repos/yetone/magpie-releases/attestations/sha256:") {
+    t.Errorf("asked %s", r.URL.Path)
+}
+```
+
+`attestRepo` 换成 `geilige/magpie` 之后，请求走 `/repos/geilige/magpie/attestations/sha256:…`，
+于是**每一条走这个 API 的测试**都会被 `t.Errorf` 判红。这行是测试代码里硬编码的上游仓库名，
+与 `testdata/attest/` 里的 fixture 内容**无关**：换 fixture 不会让它转绿，只有改 `*_test.go` 才行，
+而那违反「不改上游测试」。
+
+其中 5 条还多一层：fixture 的证书 SAN 是
+`https://github.com/yetone/magpie-releases/.github/workflows/release.yml@refs/heads/main`，
+而现在的 `attestID.SAN` 只认 `geilige/magpie`。即便把那行路径断言改掉，这几条的正向断言
+（「真实 bundle 应当通过」）仍要等我们自己第一次发布产出 bundle 才会绿。
+
+结论：这 15 条测的是「上游 fixture 与上游身份是否一致」，不是我们改动的行为。
+我们自己的 attestation 链路另行验证：首次发布后用真实 API 跑 `attestedFile` 通过。
+
+**逐条清单**（对照 `--- FAIL:` 的名字；红因 A = 假服务器断言上游仓库路径，B = 另有 fixture 的 SAN 是上游身份）
+
+| # | 测试 | 它本来测什么 | 红因 |
+|---|---|---|---|
+| 1 | `TestAttestationFromTheSite` | 站点给的 bundles 能让文件通过 | A |
+| 2 | `TestAttestationFromTheSiteOfAnotherDigestRefused` | 站点 bundle 的 digest 不对必须拒 | A |
+| 3 | `TestAttestationSiteMissGoesToGitHub` | 站点没有时转问 GitHub | A+B |
+| 4 | `TestAttestationSiteTamperedRefused` | 站点 bundle 被改过必须拒 | A+B |
+| 5 | `TestAttestationFromTheSiteWrongIdentityRefused` | 站点 bundle 身份不对必须拒 | A |
+| 6 | `TestAttestationSiteOnlyForTheSitesFiles` | 「只信站点」时不去问 GitHub | A+B |
+| 7 | `TestAttestationOfARealBundleHolds` | 真实 bundle 必须通过（正向锚点） | A+B |
+| 8 | `TestAttestationOfAnotherDigestRefused` | 别的 digest 的 bundle 必须拒 | A |
+| 9 | `TestAttestationTamperedRefused` | 签名被改的 bundle 必须拒 | A |
+| 10 | `TestAttestationEditedPayloadRefused` | payload 被改的 bundle 必须拒 | A |
+| 11 | `TestAttestationWrongIdentityRefused` | 身份（repo / workflow / ref / issuer）不对必须拒 | A+B |
+| 12 | `TestAttestationNoneListedRefused` | GitHub 说没有就拒 | A |
+| 13 | `TestAttestationUnknownGoesOnAndSaysSo` | 读不到（5xx、超时）不算拒，只在日志说明 | A |
+| 14 | `TestAttestationUnknownIsNotVerified` | 「unknown」不能被当成「已验证」 | A |
+| 15 | `TestDownloadRefusedWithoutAttestation` | 没溯源就不装 | A |
+
+另外两条常驻红与本项目无关，一并记下：`TestEnsureCompanion`、`TestPackagedByDpkg`
+（Windows 上的既有失败，未改动时同样红）。
 
 ## 机器可读区
 
