@@ -118,9 +118,15 @@ jobs:
 
       # 只要 windows 两个架构：默认 TARGETS 还含 darwin/linux/android 七个目标，
       # 这一版不发布它们（DESIGN.md D7），多编只会让流水线更慢更脆。
+      #
+      # OVERLAY= 是必须的：Makefile 那一行走 build/darwin/footprint-overlay.sh，
+      # 它按 Windows 的 GOROOT（D:\…）拼出的 overlay JSON 里反斜杠没转义，
+      # go 解析就报 invalid character 'h' in string escape code。它替换的是
+      # runtime/mem_darwin.go，GOOS=windows 根本不编译那个文件，置空不影响产物；
+      # release-windows 本来就不用 OVERLAY，所以它没踩到这个坑。
       - name: Build the CLI
         shell: bash
-        run: make release-cli VERSION="$TAG" TARGETS="windows/amd64 windows/arm64"
+        run: make release-cli VERSION="$TAG" TARGETS="windows/amd64 windows/arm64" OVERLAY=
 
       # 逐字节可控的清单：显式四个文件名、LF 行尾、<hex> + 两个空格 + 名字。
       # 不能用 sha256sum dist/*：那样会把 SHA256SUMS 自己（空文件的哈希）也写进去。
