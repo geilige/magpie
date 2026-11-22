@@ -108,7 +108,7 @@ var Vars = []string{
 	"OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_PROFILE", "OPENCLAW_HOME",
 	// MiMo Code, MiniMax Code, OpenHanako, Hermes, dsh, WorkBuddy, CodeBuddy Code
 	"MIMOCODE_HOME", "MINIMAX_DATA_DIR", "MAVIS_DATA_DIR", "HANA_HOME", "PASEO_HOME", "HERMES_HOME", "DSH_HOME",
-	"WORKBUDDY_CONFIG_DIR", "CODEBUDDY_CONFIG_DIR",
+	"WORKBUDDY_CONFIG_DIR", "WORKBUDDY_INSTANCES_ROOT", "CODEBUDDY_CONFIG_DIR",
 	// DS Bot's data folder, and its Electron userData holding locations.json
 	"DS_BOT_HOME", "DS_BOT_SHELL_DATA",
 	// DevEco Code's extra config folder, read after ~/.config/deveco

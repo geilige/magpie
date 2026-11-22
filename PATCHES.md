@@ -11,16 +11,17 @@
 
 | 文件 | 类型 | 理由 | 需求 |
 |---|---|---|---|
-| `internal/agent/workbuddy_instances.go` | 新增 | 枚举 WorkBuddy 多开实例，每个实例产出一行 Agent（行 ID 唯一 `workbuddy#N`，写文件时仍按 `workbuddy` 处理） | R7 |
-| `internal/agent/agents.go` | 修改（+1 行） | 在 `onMachineAll` 收尾的 append 链尾追加 `workbuddyInstances(home)...` | R7 |
+| `internal/agent/workbuddy_instances.go` | 新增 | 枚举 `WORKBUDDY_INSTANCES_ROOT` 下的 `instance-<n>\config`，每个实例产出一行 Agent。行 ID 唯一（`workbuddy#N`），写 `models.json` 仍按 `workbuddy` 语义 | R7 |
+| `internal/agent/workbuddy_instances_test.go` | 新增 | 上面那个文件的测试：枚举、按数字排序、写出的必须是裸数组、与默认行去重、在 `onMachine` 里注册上了 | R7 |
+| `internal/agent/agents.go` | 修改（+1 行） | `onMachineAll` 收尾的 append 链尾追加 `workbuddyInstances(home)...` | R7 |
+| `internal/agentenv/agentenv.go` | 修改（+1 行） | `Vars` 加 `WORKBUDDY_INSTANCES_ROOT`。`TestFolderVarsAreListed` 要求 package agent 读的每个目录变量都在 `Vars` 里，否则每个 sandbox 都不会清它，测试会读到开发机真实的实例目录 | R7 |
 
 ### 说明
 
-- 上面两行是 **M2 的计划**，待 M2 落地后核对实际改动：文件名、注册位置如有变化，同步改这张表和标记块。
-- 现阶段标记块里已经列了这两个路径，所以同步脚本会报 `patch target missing upstream`：
-  `workbuddy_instances.go` 还没创建，属于预期；`agents.go` 存在，不会报 missing，但要等 M2 提交后
-  才会在「upstream also touched this file」里出现。
-  M2 落地后若不想看到这条预期提示，删掉对应行即可 —— 但那时它就该真实存在了，别删。
+- M2 已落地。三个源码文件的改动与计划一致；多出来的 `agentenv.go` 一行不是新功能，是上游守护测试的硬要求
+  （`internal/agent/agentenv_test.go:65`），不加则 `go test ./internal/agent` 红。
+- `workbuddy_instances.go` 靠替换 `Sync` 和 `Fields[0].Set` 两个闭包来复用 `workbuddyBuild`，**没有改 `workbuddy.go`**。
+  上游若重构 `workbuddyBuild` 的内部实现，坏在运行期而不是编译期：详见该文件顶部注释。
 - `internal/update/signed.go`、`internal/update/update.go` 属于 M3 的更新源改造，等实际改完再登记，
   不要提前写进来（会让预警一直报「上游也在动」的假信号）。
 
@@ -35,5 +36,7 @@
 
 <!-- patches:begin -->
 internal/agent/workbuddy_instances.go
+internal/agent/workbuddy_instances_test.go
 internal/agent/agents.go
+internal/agentenv/agentenv.go
 <!-- patches:end -->
