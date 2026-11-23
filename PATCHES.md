@@ -87,6 +87,36 @@ if !strings.HasPrefix(r.URL.Path, "/repos/yetone/magpie-releases/attestations/sh
 另外两条常驻红与本项目无关，一并记下：`TestEnsureCompanion`、`TestPackagedByDpkg`
 （Windows 上的既有失败，未改动时同样红）。
 
+## 已知行为差异（instance 行 vs 默认行）
+
+WorkBuddy 多开实例的行（`workbuddy#<n>`）与默认行不完全对等。两处缺失都是结构性的，不是漏写。
+
+### 1. 没有「重启 X 后生效」提示与「重启」按钮
+
+`internal/agent/apprestart.go` 的 `AppBehind()` 用 `restartApps[a.ID]` 查一张按**精确 ID**
+索引的静态表（只有 `workbuddy`、`workbuddy-ai` 等）。`workbuddy#2` 查不到，函数直接返回 nil，
+前端拿不到 `appRestart` 就不渲染这一段。
+
+**为什么不补**：Windows 侧靠进程映像名匹配（`winExe: "WorkBuddy.exe"`），五个实例跑的是同一个
+`WorkBuddy.exe`，匹配到哪一个取决于遍历顺序——补上会**重启错实例**，比没有按钮更糟。
+
+**实测影响**：无。连接实例后不重启也立即生效（WorkBuddy 按需读取 `models.json`，而不是上游
+`appReads` 假定的「启动时读一次」）。反过来看，默认行那条提示对 WorkBuddy 是误报。注意这只是
+本机观测，不是能下结论的通用事实。
+
+### 2. 没有「改动了 ‹path›　查看 ›」的 diff 预览
+
+`internal/agent/preview.go` 的 `DisconnectPreview()` 要求 agent 的配置目录位于
+`os.UserHomeDir()` 之下（它把整个目录复制到 `%TEMP%` 才算得出差异），否则返回
+`the agent's files are outside home`。多开实例在 `D:\duokai\...`，被这条挡下，前端拿到空的
+`changes` 就不显示这一行。
+
+**为什么不补**：这条 guard 是安全边界——放开等于允许 magpie 把 home 之外任意位置的文件复制进
+临时目录。为「看一眼改了什么」开这个口子不划算。
+
+**影响**：只少一个只读视图。`断开并还原` 正常（走 `Field("provider").Set("")`）；想看差异直接
+打开 `instance-<n>\config\models.json`，它就是个裸 JSON 数组。
+
 ## 机器可读区
 
 读取规则（同步脚本按此实现，改格式必须同步改脚本）：
